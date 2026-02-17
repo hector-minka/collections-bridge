@@ -9,6 +9,9 @@ import { IntentUpdatedEventDto } from '../dto/intent-updated-event.dto';
 /**
  * Main service for Payment Collections operations
  */
+/** Per-intent-handle lock to serialize anchor proof updates and avoid duplicate proofs when webhook is called in parallel. */
+const anchorUpdateLockByIntent = new Map<string, Promise<void>>();
+
 @Injectable()
 export class CollectionsService {
   private readonly logger = new Logger(CollectionsService.name);
@@ -49,20 +52,28 @@ export class CollectionsService {
       }
 
       // Intent handle: merchantCode + ":" + paymentReferenceNumber
-      // merchantCode from target.custom.merchantCode (e.g. "0076570880"); paymentReferenceNumber from custom (e.g. "FACT-2024-001234")
+      // For dynamic-key schema: merchantCode from data.custom.merchantCode; else from target.custom.merchantCode (or target.merchantCode)
+      const schemaForMerchant =
+        anchor.data?.schema || event.data?.anchor?.data?.schema || null;
+      const schemaStr = schemaForMerchant == null ? '' : String(schemaForMerchant);
+      const isDynamicKey =
+        schemaStr === 'dynamic-key' || schemaStr === 'dynamic-keys';
       const target = anchor.data?.target as
         | string
         | { handle?: string; custom?: { merchantCode?: string }; merchantCode?: string }
         | undefined;
-      const merchantCodeRaw =
-        (typeof target === 'object' && target !== null && (target?.custom?.merchantCode ?? target?.merchantCode)) ||
-        (typeof target === 'string' ? target : null) ||
-        null;
+      const merchantCodeRaw = isDynamicKey
+        ? anchor.data?.custom?.merchantCode
+        : (typeof target === 'object' && target !== null && (target?.custom?.merchantCode ?? target?.merchantCode)) ||
+          (typeof target === 'string' ? target : null) ||
+          null;
       const merchantCode = typeof merchantCodeRaw === 'string' ? merchantCodeRaw : null;
       const paymentReferenceNumber = anchor.data?.custom?.paymentReferenceNumber;
       if (!merchantCode || !paymentReferenceNumber) {
         throw new Error(
-          'Anchor must have target.custom.merchantCode (or target.merchantCode) and custom.paymentReferenceNumber to derive intent handle',
+          isDynamicKey
+            ? 'Anchor (dynamic-key) must have data.custom.merchantCode and custom.paymentReferenceNumber to derive intent handle'
+            : 'Anchor must have target.custom.merchantCode (or target.merchantCode) and custom.paymentReferenceNumber to derive intent handle',
         );
       }
       const intentHandleFromAnchor = `${merchantCode}:${paymentReferenceNumber}`;
@@ -80,7 +91,7 @@ export class CollectionsService {
       }
       this.logger.log(`Using merchantTxId: ${merchantTxId}`);
 
-      const schema = anchor.data?.schema || event.data?.anchor?.data?.schema || null;
+      const schema = schemaForMerchant ?? anchor.data?.schema ?? event.data?.anchor?.data?.schema ?? null;
       this.logger.log(`Extracted schema: ${schema}`);
 
       // Claim target: anchor.target as handle (string or target.handle)
@@ -320,10 +331,16 @@ export class CollectionsService {
       const anchorData = anchor.data || anchor;
       this.logger.log(`Found anchor: ${anchorData.handle}`);
 
-      // Extract merchantcode and paymentReferenceNumber from anchor
+      // Extract merchantCode and paymentReferenceNumber from anchor
+      // For dynamic-key schema: merchantCode from data.custom.merchantCode; else from target
+      const anchorSchema =
+        anchorData.schema ?? (anchor as any)?.data?.schema ?? null;
+      const isDynamicKey =
+        anchorSchema === 'dynamic-key' || anchorSchema === 'dynamic-keys';
       const targetObj = anchorData.target;
-      const merchantCodeRaw =
-        typeof targetObj === 'object' && targetObj !== null
+      const merchantCodeRaw = isDynamicKey
+        ? anchorData.custom?.merchantCode
+        : typeof targetObj === 'object' && targetObj !== null
           ? targetObj.custom?.merchantCode ?? targetObj.merchantCode
           : null;
       const merchantCode =
@@ -379,6 +396,65 @@ export class CollectionsService {
           `Intent ${intentHandleOnDemoLedger} already has our committed proof, skipping (idempotent)`,
         );
       }
+
+      // Update status of all anchors in intent labels: COMPLETED for the one that fulfilled, CANCELLED for the rest.
+      // Serialize by intent handle so parallel webhook calls don't all send duplicate proofs (race-safe idempotency).
+      const previousLock = anchorUpdateLockByIntent.get(intentHandleOnDemoLedger);
+      const thisRun = (async () => {
+        await previousLock;
+        const intentRecord = await this.ledgerService.getIntent(intentHandleOnDemoLedger);
+        const anchorHandles = this.ledgerService.getAnchorHandlesFromIntentLabels(intentRecord);
+        const moment = new Date().toISOString();
+        const paymentReference = intentHandleOnDemoLedger;
+        const completingAnchorHandle = anchorData.handle;
+
+        for (const anchorHandle of anchorHandles) {
+          try {
+            if (anchorHandle === completingAnchorHandle) {
+              const alreadyCompleted = await this.ledgerService.anchorHasProofFromUs(
+                anchorHandle,
+                'COMPLETED',
+              );
+              if (!alreadyCompleted) {
+                await this.ledgerService.addProofToAnchor(anchorHandle, {
+                  moment,
+                  status: 'COMPLETED',
+                  reason: 'completed',
+                  paymentReference,
+                });
+              } else {
+                this.logger.log(
+                  `Anchor ${anchorHandle} already has our COMPLETED proof, skipping (idempotent)`,
+                );
+              }
+            } else {
+              const alreadyCancelled = await this.ledgerService.anchorHasProofFromUs(
+                anchorHandle,
+                'CANCELLED',
+              );
+              if (!alreadyCancelled) {
+                await this.ledgerService.addProofToAnchor(anchorHandle, {
+                  moment,
+                  status: 'CANCELLED',
+                  reason: `completed by ${completingAnchorHandle}`,
+                  paymentReference,
+                });
+              } else {
+                this.logger.log(
+                  `Anchor ${anchorHandle} already has our CANCELLED proof, skipping (idempotent)`,
+                );
+              }
+            }
+          } catch (err) {
+            this.logger.warn(
+              `Failed to add proof to anchor ${anchorHandle}: ${err?.message}. Continuing with other anchors.`,
+            );
+          }
+        }
+      })();
+      anchorUpdateLockByIntent.set(intentHandleOnDemoLedger, thisRun);
+      await thisRun;
+      anchorUpdateLockByIntent.delete(intentHandleOnDemoLedger);
 
       // Update collection status to COMPLETED
       // Try to find collection by intent handle or merchantTxId

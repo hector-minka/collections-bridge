@@ -126,8 +126,9 @@ export class LedgerService {
   }
 
   /**
-   * Search for anchor by idQR (which maps to custom.paymentId) or aliasValue on payment-initiation-demo ledger
-   * For QR (paymentId) we use direct HTTP GET with x-schema: qr-code; for alias we use SDK list.
+   * Search for anchor by idQR (which maps to custom.paymentId) or aliasValue on payment-initiation-demo ledger.
+   * - For QR: direct HTTP GET with x-schema: qr-code (paymentId).
+   * - For alias (dynamic-key): aliasValue is the anchor handle, so we use sdk.anchor.read(aliasValue).
    */
   async findAnchorByIdQROrAliasValue(
     idQR?: string,
@@ -145,27 +146,22 @@ export class LedgerService {
         if (anchor) return anchor;
       }
 
-      // Try searching by aliasValue
+      // For aliasValue (dynamic-key): the value is the anchor handle — read by handle
       if (aliasValue) {
-        this.logger.log(`Searching anchor by aliasValue: ${aliasValue}`);
-        let response = await (this.sdk.anchor as any).list({
-          'data.custom.aliasValue': aliasValue,
-        });
-        let listData = response?.data || response;
-        let items = listData?.list || listData?.items || [];
-        
-        // Also try searching in labels
-        if (items.length === 0) {
-          response = await (this.sdk.anchor as any).list({
-            'meta.labels': `aliasValue:${aliasValue}`,
-          });
-          listData = response?.data || response;
-          items = listData?.list || listData?.items || [];
-        }
-
-        if (items.length > 0) {
-          this.logger.log(`Found anchor by aliasValue: ${items[0]?.data?.handle || items[0]?.handle}`);
-          return items[0];
+        this.logger.log(`Reading anchor by handle (aliasValue / dynamic-key): ${aliasValue}`);
+        try {
+          const anchorResponse = await this.sdk.anchor.read(aliasValue);
+          const record = (anchorResponse as any).response?.data ?? anchorResponse;
+          if (record?.data?.handle ?? record?.handle) {
+            this.logger.log(`Found anchor by handle: ${record?.data?.handle ?? record?.handle}`);
+            return record;
+          }
+        } catch (readErr: any) {
+          if (readErr?.response?.status === 404 || readErr?.code === 'ERR_BAD_REQUEST') {
+            this.logger.warn(`Anchor not found by handle: ${aliasValue}`);
+          } else {
+            throw readErr;
+          }
         }
       }
 
@@ -528,6 +524,92 @@ export class LedgerService {
       return record;
     } catch (error) {
       this.logger.error(`Error getting intent ${handle}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Extract anchor handles from intent meta.labels. Labels are stored as "anchorHandle:schema" (e.g. "QR-xxx:qr-code").
+   * Skips non-anchor labels like "merchant-txid:...".
+   */
+  getAnchorHandlesFromIntentLabels(intentRecord: any): string[] {
+    const labels = intentRecord?.meta?.labels ?? intentRecord?.labels ?? [];
+    const handles: string[] = [];
+    for (const label of Array.isArray(labels) ? labels : []) {
+      const s = typeof label === 'string' ? label : String(label);
+      const idx = s.indexOf(':');
+      if (idx > 0) {
+        const handle = s.slice(0, idx).trim();
+        if (handle && handle !== 'merchant-txid') handles.push(handle);
+      }
+    }
+    return [...new Set(handles)];
+  }
+
+  /**
+   * Returns true if the anchor already has a proof with the given status from our signer.
+   * Used to make anchor status updates idempotent when the webhook is retried or called multiple times.
+   */
+  async anchorHasProofFromUs(
+    anchorHandle: string,
+    status: 'COMPLETED' | 'CANCELLED',
+  ): Promise<boolean> {
+    try {
+      const config = this.configService.get('minka');
+      const record = await this.getAnchor(anchorHandle);
+      const proofs = record?.meta?.proofs ?? [];
+      const ourPublic = config.signer.public;
+      return proofs.some(
+        (p: any) => p?.public === ourPublic && p?.custom?.status === status,
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Add a proof to an anchor (e.g. COMPLETED or CANCELLED). Uses SDK anchor.from(record).hash().sign().send().
+   */
+  async addProofToAnchor(
+    anchorHandle: string,
+    custom: {
+      moment: string;
+      status: 'COMPLETED' | 'CANCELLED';
+      reason: string;
+      paymentReference: string;
+    },
+  ): Promise<any> {
+    try {
+      const config = this.configService.get('minka');
+      const record = await this.getAnchor(anchorHandle);
+      if (!record?.data?.handle) {
+        throw new Error(`Anchor record missing data.handle for ${anchorHandle}`);
+      }
+
+      const { response } = await this.sdk.anchor
+        .from(record)
+        .hash()
+        .sign([
+          {
+            keyPair: {
+              format: config.signer.format,
+              public: config.signer.public,
+              secret: config.signer.secret,
+            },
+            custom: {
+              moment: custom.moment,
+              status: custom.status,
+              reason: custom.reason,
+              paymentReference: custom.paymentReference,
+            },
+          },
+        ])
+        .send();
+
+      this.logger.log(`Proof added to anchor ${anchorHandle}: status=${custom.status}`);
+      return response;
+    } catch (error) {
+      this.logger.error(`Error adding proof to anchor ${anchorHandle}:`, error);
       throw error;
     }
   }
