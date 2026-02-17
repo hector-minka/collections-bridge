@@ -1,0 +1,33 @@
+{
+  "name": "minka-crypto-utils",
+  "version": "1.0.0",
+  "description": "Cryptographic utilities for Minka Ledger API operations",
+  "main": "index.ts",
+  "types": "index.ts",
+  "scripts": {
+    "build": "tsc",
+    "type-check": "tsc --noEmit"
+  },
+  "keywords": [
+    "minka",
+    "ledger",
+    "crypto",
+    "ed25519",
+    "jwt",
+    "signature"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@minka/ledger-sdk": "^2.25.0",
+    "@noble/ed25519": "^1.0.0",
+    "base64url": "^3.0.1",
+    "detect-node": "^2.1.0",
+    "jose": "^6.0.11",
+    "safe-stable-stringify": "^2.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.12",
+    "typescript": "^5.8.3"
+  }
+}
