@@ -1,11 +1,13 @@
-# Docker Compose configuration
+# Docker Compose configuration for Collections Bridge (production-style, aligned with pi-bridge)
+# Deploy on Ubuntu: copy .env.example to .env, set variables, then:
+#   docker compose up -d --build
 # Note: 'version' field is obsolete in Docker Compose v2+
 
 services:
   postgres:
     image: postgres:15-alpine
     container_name: collections-bridge-postgres
-    restart: unless-stopped
+    restart: always
     env_file:
       - .env
     environment:
@@ -13,12 +15,13 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: ${DB_NAME}
       PGDATA: /var/lib/postgresql/data/pgdata
-      # PostgreSQL configuration for production
       POSTGRES_INITDB_ARGS: '-E UTF8 --locale=C'
-    ports:
-      - '${DB_PORT}:5432'
+    # Don't expose ports in production if using internal network only
+    # ports:
+    #   - "${DB_PORT}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./scripts/create-tables.sql:/docker-entrypoint-initdb.d/01-create-tables.sql:ro
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U ${DB_USERNAME} -d ${DB_NAME}']
       interval: 10s
@@ -27,15 +30,20 @@ services:
       start_period: 10s
     networks:
       - collections-bridge-network
-    # Resource limits for production
     deploy:
       resources:
         limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
           memory: 512M
           cpus: '0.5'
-        reservations:
-          memory: 256M
-          cpus: '0.25'
+    user: '70:70'
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '10m'
+        max-file: '3'
 
   app:
     build:
@@ -43,15 +51,13 @@ services:
       dockerfile: Dockerfile
       target: production
     container_name: collections-bridge-app
-    restart: unless-stopped
+    restart: always
     env_file:
       - .env
     environment:
-      # Node environment
-      NODE_ENV: ${NODE_ENV}
+      NODE_ENV: production
       PORT: ${PORT}
 
-      # Database configuration (override host to use service name)
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USERNAME: ${DB_USERNAME}
@@ -60,7 +66,6 @@ services:
       DB_SYNCHRONIZE: ${DB_SYNCHRONIZE}
       DB_LOGGING: ${DB_LOGGING}
 
-      # Minka Ledger configuration
       MINKA_LEDGER_SERVER: ${MINKA_LEDGER_SERVER}
       MINKA_LEDGER_NAME: ${MINKA_LEDGER_NAME}
       MINKA_LEDGER_TIMEOUT: ${MINKA_LEDGER_TIMEOUT}
@@ -69,37 +74,44 @@ services:
       MINKA_SIGNER_PUBLIC: ${MINKA_SIGNER_PUBLIC}
       MINKA_SIGNER_SECRET: ${MINKA_SIGNER_SECRET}
 
-      # Application configuration
+      INTENT_CLAIM_SOURCE_HANDLE: ${INTENT_CLAIM_SOURCE_HANDLE:-servibanca}
+
       CORS_ORIGIN: ${CORS_ORIGIN}
       LOG_LEVEL: ${LOG_LEVEL}
     ports:
-      - '${PORT}:3000'
+      - '${PORT}:${PORT}'
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
       test:
-        [
-          'CMD',
-          'node',
-          '-e',
-          "require('http').get('http://localhost:3000/api/v1/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})",
-        ]
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://localhost:${PORT}/api/v1/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
     networks:
       - collections-bridge-network
-    # Resource limits for production
     deploy:
       resources:
         limits:
+          memory: 1G
+          cpus: '2.0'
+        reservations:
           memory: 512M
           cpus: '1.0'
-        reservations:
-          memory: 256M
-          cpus: '0.5'
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '10m'
+        max-file: '3'
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/tmp
 
 volumes:
   postgres_data:
