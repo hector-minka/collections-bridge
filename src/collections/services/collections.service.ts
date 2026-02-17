@@ -218,7 +218,13 @@ export class CollectionsService {
 
   /**
    * Runs asynchronously after the webhook has already responded with success.
-   * Logs the full request; later can do submitProof + DB update.
+   * Processes RTP intent-updated events when status is "committed":
+   * 1. Extracts claim[0].target (idQR or aliasValue)
+   * 2. Finds anchor on payment-initiation-demo ledger
+   * 3. Gets merchantcode and paymentReferenceNumber from anchor
+   * 4. Finds intent on payment-initiation-demo ledger
+   * 5. Submits proof with committed status to complete quorum
+   * 6. Updates collection status to COMPLETED
    * Errors are caught and logged so they do not become unhandled rejections.
    */
   async processIntentUpdatedEventAsync(
@@ -243,13 +249,169 @@ export class CollectionsService {
     this.logger.log(JSON.stringify(fullRequestLog, null, 2));
     this.logger.log('=== END RTP WEBHOOK ASYNC ===');
 
-    const intentHandle = (body?.data as any)?.intent?.data?.handle;
-    const signal = (body?.data as any)?.signal;
-    this.logger.log(
-      `Event summary: signal=${signal ?? 'n/a'}, intentHandle=${intentHandle ?? 'n/a'}`,
-    );
+    try {
+      const intentData = (body?.data as any)?.intent?.data;
+      const intentMeta = (body?.data as any)?.intent?.meta;
+      const signal = (body?.data as any)?.signal;
+      const intentHandle = intentData?.handle;
+      const status = intentMeta?.status;
 
-    // TODO: submitProof + update collection to COMPLETED when ready
+      this.logger.log(
+        `Event summary: signal=${signal ?? 'n/a'}, intentHandle=${intentHandle ?? 'n/a'}, status=${status ?? 'n/a'}`,
+      );
+
+      // Only process if status is "committed"
+      if (status !== 'committed') {
+        this.logger.log(
+          `Intent status is "${status}", not "committed". Skipping fulfillment processing.`,
+        );
+        return;
+      }
+
+      // Extract claim[0].target which should have idQR or aliasValue
+      const claims = intentData?.claims || [];
+      if (claims.length === 0) {
+        this.logger.warn('No claims found in intent data');
+        return;
+      }
+
+      const firstClaim = claims[0];
+      const target = firstClaim?.target;
+      if (!target) {
+        this.logger.warn('No target found in first claim');
+        return;
+      }
+
+      // Extract idQR or aliasValue from target.custom
+      // RTP may send "idQr" (camelCase) or "idQR"; both map to paymentId for QR anchor search
+      const idQR =
+        typeof target === 'object' && target !== null
+          ? target.custom?.idQR ?? target.custom?.idQr ?? null
+          : null;
+      const aliasValue =
+        typeof target === 'object' && target !== null
+          ? target.custom?.aliasValue ?? null
+          : null;
+
+      if (!idQR && !aliasValue) {
+        this.logger.warn(
+          `Target does not contain idQR or aliasValue: ${JSON.stringify(target)}`,
+        );
+        return;
+      }
+
+      this.logger.log(
+        `Extracted from claim[0].target: idQR=${idQR ?? 'n/a'}, aliasValue=${aliasValue ?? 'n/a'}`,
+      );
+
+      // Find anchor on payment-initiation-demo ledger
+      const anchor = await this.ledgerService.findAnchorByIdQROrAliasValue(
+        idQR,
+        aliasValue,
+      );
+
+      if (!anchor) {
+        this.logger.error(
+          `No anchor found on payment-initiation-demo ledger for idQR=${idQR}, aliasValue=${aliasValue}`,
+        );
+        return;
+      }
+
+      const anchorData = anchor.data || anchor;
+      this.logger.log(`Found anchor: ${anchorData.handle}`);
+
+      // Extract merchantcode and paymentReferenceNumber from anchor
+      const targetObj = anchorData.target;
+      const merchantCodeRaw =
+        typeof targetObj === 'object' && targetObj !== null
+          ? targetObj.custom?.merchantCode ?? targetObj.merchantCode
+          : null;
+      const merchantCode =
+        typeof merchantCodeRaw === 'string' ? merchantCodeRaw : null;
+      const paymentReferenceNumber = anchorData.custom?.paymentReferenceNumber;
+
+      if (!merchantCode || !paymentReferenceNumber) {
+        this.logger.error(
+          `Anchor missing merchantCode or paymentReferenceNumber. merchantCode=${merchantCode}, paymentReferenceNumber=${paymentReferenceNumber}`,
+        );
+        return;
+      }
+
+      this.logger.log(
+        `Extracted from anchor: merchantCode=${merchantCode}, paymentReferenceNumber=${paymentReferenceNumber}`,
+      );
+
+      // Find intent on payment-initiation-demo ledger
+      const intent = await this.ledgerService.getIntentByMerchantCodeAndPaymentReference(
+        merchantCode,
+        paymentReferenceNumber,
+      );
+
+      if (!intent) {
+        this.logger.error(
+          `No intent found on payment-initiation-demo ledger for merchantCode=${merchantCode}, paymentReferenceNumber=${paymentReferenceNumber}`,
+        );
+        return;
+      }
+
+      const intentHandleOnDemoLedger =
+        intent?.data?.handle ?? intent?.data?.data?.handle ?? (intent as any)?.handle;
+      this.logger.log(`Found intent on payment-initiation-demo ledger: ${intentHandleOnDemoLedger}`);
+
+      // Idempotency: skip proof if we already submitted a committed proof for this intent
+      const alreadyHasOurProof = await this.ledgerService.intentHasCommittedProofFromUs(
+        intentHandleOnDemoLedger,
+      );
+      const proofDetail = {
+        rtpIntentHandle: intentHandle,
+        rtpStatus: status,
+        fulfilledAt: new Date().toISOString(),
+        anchorHandle: anchorData.handle,
+      };
+
+      if (!alreadyHasOurProof) {
+        await this.ledgerService.submitProof(intentHandleOnDemoLedger, proofDetail);
+        this.logger.log(
+          `Proof submitted to intent ${intentHandleOnDemoLedger} with committed status`,
+        );
+      } else {
+        this.logger.log(
+          `Intent ${intentHandleOnDemoLedger} already has our committed proof, skipping (idempotent)`,
+        );
+      }
+
+      // Update collection status to COMPLETED
+      // Try to find collection by intent handle or merchantTxId
+      let collection = await this.collectionRepository.findOne({
+        where: { intentHandle: intentHandleOnDemoLedger },
+      });
+
+      if (!collection) {
+        // Try to find by merchantTxId if we can derive it
+        const merchantTxId = anchorData.custom?.metadata?.merchantTxId || intentHandleOnDemoLedger;
+        collection = await this.collectionRepository.findOne({
+          where: { merchantTxId },
+        });
+      }
+
+      if (collection) {
+        collection.status = 'COMPLETED';
+        collection.fulfillmentEvidence = proofDetail as Record<string, any>;
+        collection.fulfilledAt = new Date();
+        await this.collectionRepository.save(collection);
+        this.logger.log(`Collection ${collection.id} updated to COMPLETED status`);
+      } else {
+        this.logger.warn(
+          `No collection found for intentHandle=${intentHandleOnDemoLedger}. Proof submitted but collection not updated.`,
+        );
+      }
+    } catch (error) {
+      this.logger.error(
+        `Error processing RTP intent-updated event: ${error?.message}`,
+        error?.stack,
+      );
+      // Don't throw - errors are logged but don't fail the webhook response
+    }
   }
 
   /**

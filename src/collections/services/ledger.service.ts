@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { LedgerSdk } from '@minka/ledger-sdk';
-import { generateSignature } from '../../../crypto-utils';
+import { generateSignature, signJWT } from '../../../crypto-utils';
 
 /**
  * Service for interacting with Minka Ledger SDK
@@ -69,6 +69,136 @@ export class LedgerService {
       return items[0] || null;
     } catch (error) {
       this.logger.error(`Error getting anchor by label ${key}:${value}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Search for anchor by paymentId (idQR) using direct HTTP GET with x-schema: qr-code.
+   * The SDK list() does not reliably send that header; this matches the working request.
+   */
+  private async findAnchorByPaymentIdDirectRequest(paymentId: string): Promise<any> {
+    const config = this.configService.get('minka');
+    const server = config.ledger.server?.replace(/\/$/, '');
+    const ledger = config.ledger.ledger;
+    if (!server || !ledger) {
+      this.logger.warn('Ledger server or name not configured, skipping direct anchor search');
+      return null;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const jwt = await signJWT(
+      {
+        iss: config.signer.public,
+        sub: `signer:${config.signer.public}`,
+        aud: ledger,
+        iat: now,
+        exp: now + 60,
+      },
+      config.signer.secret,
+      config.signer.public,
+    );
+    const iso = new Date().toISOString();
+    const url = new URL(`${server}/anchors`);
+    url.searchParams.set('data.custom.paymentId', paymentId);
+    const res = await fetch(url.toString(), {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-ledger': ledger,
+        Authorization: `Bearer ${jwt}`,
+        'x-received': iso,
+        'x-dispatched': iso,
+        'x-schema': 'qr-code',
+      },
+    });
+    if (!res.ok) {
+      this.logger.warn(`Direct anchor search failed: ${res.status} ${res.statusText}`);
+      return null;
+    }
+    const body = await res.json();
+    const anchors = body?.data ?? body?.list ?? [];
+    const items = Array.isArray(anchors) ? anchors : [];
+    if (items.length > 0) {
+      this.logger.log(`Found anchor by paymentId (direct request): ${items[0]?.data?.handle ?? items[0]?.handle}`);
+      return items[0];
+    }
+    return null;
+  }
+
+  /**
+   * Search for anchor by idQR (which maps to custom.paymentId) or aliasValue on payment-initiation-demo ledger
+   * For QR (paymentId) we use direct HTTP GET with x-schema: qr-code; for alias we use SDK list.
+   */
+  async findAnchorByIdQROrAliasValue(
+    idQR?: string,
+    aliasValue?: string,
+  ): Promise<any> {
+    try {
+      if (!idQR && !aliasValue) {
+        throw new Error('Either idQR or aliasValue must be provided');
+      }
+
+      // Search by idQR (paymentId) via direct request so x-schema: qr-code is sent
+      if (idQR) {
+        this.logger.log(`Searching anchor by idQR (paymentId): ${idQR}`);
+        const anchor = await this.findAnchorByPaymentIdDirectRequest(idQR);
+        if (anchor) return anchor;
+      }
+
+      // Try searching by aliasValue
+      if (aliasValue) {
+        this.logger.log(`Searching anchor by aliasValue: ${aliasValue}`);
+        let response = await (this.sdk.anchor as any).list({
+          'data.custom.aliasValue': aliasValue,
+        });
+        let listData = response?.data || response;
+        let items = listData?.list || listData?.items || [];
+        
+        // Also try searching in labels
+        if (items.length === 0) {
+          response = await (this.sdk.anchor as any).list({
+            'meta.labels': `aliasValue:${aliasValue}`,
+          });
+          listData = response?.data || response;
+          items = listData?.list || listData?.items || [];
+        }
+
+        if (items.length > 0) {
+          this.logger.log(`Found anchor by aliasValue: ${items[0]?.data?.handle || items[0]?.handle}`);
+          return items[0];
+        }
+      }
+
+      this.logger.warn(`No anchor found for idQR/paymentId=${idQR}, aliasValue=${aliasValue}`);
+      return null;
+    } catch (error) {
+      this.logger.error(
+        `Error finding anchor by idQR/aliasValue (idQR=${idQR}, aliasValue=${aliasValue}):`,
+        error,
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * Get intent by merchantcode and paymentReferenceNumber
+   * Intent handle format: merchantcode:paymentReferenceNumber
+   */
+  async getIntentByMerchantCodeAndPaymentReference(
+    merchantCode: string,
+    paymentReferenceNumber: string,
+  ): Promise<any> {
+    try {
+      const intentHandle = `${merchantCode}:${paymentReferenceNumber}`;
+      this.logger.log(
+        `Getting intent by handle: ${intentHandle} (merchantCode: ${merchantCode}, paymentReferenceNumber: ${paymentReferenceNumber})`,
+      );
+      return await this.getIntent(intentHandle);
+    } catch (error) {
+      this.logger.error(
+        `Error getting intent by merchantCode/paymentReference (merchantCode=${merchantCode}, paymentReferenceNumber=${paymentReferenceNumber}):`,
+        error,
+      );
       throw error;
     }
   }
@@ -324,18 +454,40 @@ export class LedgerService {
   }
 
   /**
-   * Submit proof to intent (evidence/committed). Uses SDK intent.from(record).hash().sign().send().
+   * Returns true if the intent already has a proof with status "committed" from our signer.
+   * Used to make RTP fulfillment idempotent when multiple intent-updated events are received.
+   */
+  async intentHasCommittedProofFromUs(intentHandle: string): Promise<boolean> {
+    try {
+      const config = this.configService.get('minka');
+      const record = await this.getIntent(intentHandle);
+      const proofs = record?.meta?.proofs ?? [];
+      const ourPublic = config.signer.public;
+      return proofs.some(
+        (p: any) =>
+          p?.public === ourPublic && p?.custom?.status === 'committed',
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Submit proof to intent (detail/committed). Uses SDK intent.from(record).hash().sign().send().
    */
   async submitProof(
     intentHandle: string,
-    evidence: Record<string, any>,
+    detail: Record<string, any>,
   ): Promise<any> {
     try {
       const config = this.configService.get('minka');
+      // IntentProofCustom.detail is typed as string in the SDK; serialize object to JSON
+      // coreId = RTP intent handle for Payments Hub standard in reports
       const signatureCustom = {
         moment: new Date().toISOString(),
         status: 'committed' as const,
-        evidence,
+        detail: typeof detail === 'string' ? detail : JSON.stringify(detail),
+        ...(detail?.rtpIntentHandle && { coreId: detail.rtpIntentHandle }),
       };
 
       const intentResponse = await this.sdk.intent.read(intentHandle);
