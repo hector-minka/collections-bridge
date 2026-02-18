@@ -79,30 +79,17 @@ export class CreateCollectionsTable1736698762000 implements MigrationInterface {
       true,
     );
 
-    // Create indexes
-    await queryRunner.createIndex(
-      'collections',
-      new TableIndex({
-        name: 'IDX_collections_merchantTxId',
-        columnNames: ['merchantTxId'],
-      }),
-    );
-
-    await queryRunner.createIndex(
-      'collections',
-      new TableIndex({
-        name: 'IDX_collections_anchorHandle',
-        columnNames: ['anchorHandle'],
-      }),
-    );
-
-    await queryRunner.createIndex(
-      'collections',
-      new TableIndex({
-        name: 'IDX_collections_intentHandle',
-        columnNames: ['intentHandle'],
-      }),
-    );
+    // Create indexes (idempotent: IF NOT EXISTS)
+    // TypeORM's createIndex doesn't support IF NOT EXISTS, so we use raw SQL
+    await queryRunner.query(`
+      CREATE INDEX IF NOT EXISTS "IDX_collections_merchantTxId" ON "collections" ("merchantTxId");
+    `);
+    await queryRunner.query(`
+      CREATE INDEX IF NOT EXISTS "IDX_collections_anchorHandle" ON "collections" ("anchorHandle");
+    `);
+    await queryRunner.query(`
+      CREATE INDEX IF NOT EXISTS "IDX_collections_intentHandle" ON "collections" ("intentHandle");
+    `);
   }
 
   public async down(queryRunner: QueryRunner): Promise<void> {
