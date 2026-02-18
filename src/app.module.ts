@@ -12,6 +12,7 @@ import { AppController } from './app.controller';
 import configuration from './config/configuration';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { CollectionEntity } from './collections/entities/collection.entity';
+import { CreateCollectionsTable1736698762000 } from './migrations/1736698762000-CreateCollectionsTable';
 
 @Module({
   imports: [
@@ -61,6 +62,8 @@ import { CollectionEntity } from './collections/entities/collection.entity';
         password: configService.get('database.password'),
         database: configService.get('database.database'),
         entities: [CollectionEntity],
+        migrations: [CreateCollectionsTable1736698762000],
+        migrationsRun: true,
         synchronize: configService.get('database.synchronize'),
         logging: configService.get('database.logging'),
       }),
