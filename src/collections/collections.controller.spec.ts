@@ -23,6 +23,7 @@ describe('CollectionsController', () => {
     const mockCollectionsService = {
       handleAnchorCreated: jest.fn().mockResolvedValue(mockCollection),
       processIntentUpdatedEventAsync: jest.fn().mockResolvedValue(undefined),
+      processAnchorProofsAdded: jest.fn().mockResolvedValue(undefined),
       getCollectionByMerchantTxId: jest.fn().mockResolvedValue(mockCollection),
       getCollectionByAnchorHandle: jest.fn().mockResolvedValue(mockCollection),
       getCollectionByIntentHandle: jest.fn().mockResolvedValue(mockCollection),
@@ -129,6 +130,36 @@ describe('CollectionsController', () => {
           url: '/api/v1/collections/webhooks/rtp-fulfillment',
           path: '/path',
         }),
+      );
+    });
+  });
+
+  describe('POST /collections/webhooks/anchor-proofs-added', () => {
+    const validAnchorProofsBody = {
+      hash: 'h1',
+      data: {
+        handle: 'evt_xyz',
+        signal: 'anchor-proofs-added',
+        anchor: 'my-anchor',
+        proofs: [{ custom: { status: 'COMPLETED' } }],
+      },
+    };
+
+    it('returns 200 and { success: true } immediately', async () => {
+      const req = { body: validAnchorProofsBody } as any;
+      const result = await controller.handleAnchorProofsAdded(
+        validAnchorProofsBody as any,
+        req,
+      );
+      expect(result).toEqual({ success: true });
+    });
+
+    it('calls processAnchorProofsAdded with body (async)', async () => {
+      const req = { body: validAnchorProofsBody } as any;
+      await controller.handleAnchorProofsAdded(validAnchorProofsBody as any, req);
+      await new Promise((r) => setImmediate(r));
+      expect(service.processAnchorProofsAdded).toHaveBeenCalledWith(
+        validAnchorProofsBody,
       );
     });
   });

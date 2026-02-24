@@ -30,6 +30,7 @@ describe('Collections API (e2e)', () => {
     mockCollectionsService = {
       handleAnchorCreated: jest.fn().mockResolvedValue(mockCollection),
       processIntentUpdatedEventAsync: jest.fn().mockResolvedValue(undefined),
+      processAnchorProofsAdded: jest.fn().mockResolvedValue(undefined),
       getCollectionByMerchantTxId: jest.fn().mockRejectedValue(notFound),
       getCollectionByAnchorHandle: jest.fn().mockRejectedValue(notFound),
       getCollectionByIntentHandle: jest.fn().mockRejectedValue(notFound),
@@ -62,6 +63,7 @@ describe('Collections API (e2e)', () => {
     mockCollectionsService.getCollections.mockResolvedValue([]);
     mockCollectionsService.handleAnchorCreated.mockResolvedValue(mockCollection as any);
     mockCollectionsService.processIntentUpdatedEventAsync.mockResolvedValue(undefined);
+    mockCollectionsService.processAnchorProofsAdded.mockResolvedValue(undefined);
   });
 
   describe('POST /api/v1/collections/webhooks/anchor-created', () => {
@@ -122,6 +124,44 @@ describe('Collections API (e2e)', () => {
 
       expect(res.body).toEqual({ success: true });
       expect(mockCollectionsService.processIntentUpdatedEventAsync).toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /api/v1/collections/webhooks/anchor-proofs-added', () => {
+    it('returns 200 and { success: true }', async () => {
+      const body = {
+        hash: 'h1',
+        data: {
+          handle: 'evt_xyz',
+          signal: 'anchor-proofs-added',
+          anchor: 'my-anchor',
+          proofs: [{ custom: { status: 'COMPLETED' } }],
+        },
+      };
+
+      const res = await request(app.getHttpServer())
+        .post('/api/v1/collections/webhooks/anchor-proofs-added')
+        .send(body)
+        .expect(200);
+
+      expect(res.body).toEqual({ success: true });
+    });
+
+    it('calls processAnchorProofsAdded with request body', async () => {
+      const body = {
+        data: {
+          handle: 'evt_e2e',
+          signal: 'anchor-proofs-added',
+          anchor: 'anchor-1',
+          proofs: [{ custom: { status: 'INACTIVE' } }],
+        },
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/collections/webhooks/anchor-proofs-added')
+        .send(body)
+        .expect(200);
+      await new Promise((r) => setImmediate(r));
+      expect(mockCollectionsService.processAnchorProofsAdded).toHaveBeenCalledWith(body);
     });
   });
 
@@ -214,6 +254,20 @@ describe('Collections API (e2e)', () => {
               data: { claims: [] },
               meta: { status: 'prepared' },
             },
+          },
+        })
+        .expect(200);
+      expect(res.body).toHaveProperty('success', true);
+    });
+
+    it('anchor-proofs-added response has success', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/api/v1/collections/webhooks/anchor-proofs-added')
+        .send({
+          data: {
+            signal: 'anchor-proofs-added',
+            anchor: 'a1',
+            proofs: [{ custom: { status: 'COMPLETED' } }],
           },
         })
         .expect(200);

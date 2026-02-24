@@ -75,6 +75,10 @@ describe('CollectionsService', () => {
       getAnchorHandlesFromIntentLabels: jest.fn(),
       anchorHasProofFromUs: jest.fn(),
       addProofToAnchor: jest.fn(),
+      getAnchor: jest.fn(),
+      getAnchorStatus: jest.fn(),
+      anchorHasProofWithStatus: jest.fn(),
+      addProofToAnchorWithCustom: jest.fn(),
     };
 
     const mockRepository = {
@@ -271,6 +275,136 @@ describe('CollectionsService', () => {
       const result = await service.getCollections({ status: 'PENDING', merchantTxId: 'tx-1' });
       expect(result).toEqual([mockCollection]);
       expect(getMany).toHaveBeenCalled();
+    });
+  });
+
+  describe('processAnchorProofsAdded', () => {
+    const validBody = {
+      hash: 'h1',
+      data: {
+        handle: 'evt_abc123',
+        signal: 'anchor-proofs-added',
+        anchor: 'my-anchor',
+        proofs: [{ custom: { status: 'COMPLETED', reason: 'paid' } }],
+      },
+    };
+
+    it('skips when signal is not anchor-proofs-added', async () => {
+      const body = { ...validBody, data: { ...validBody.data, signal: 'other' } };
+      await service.processAnchorProofsAdded(body as any);
+      expect(ledgerService.getAnchor).not.toHaveBeenCalled();
+    });
+
+    it('skips when data.anchor is missing', async () => {
+      const body = { data: { signal: 'anchor-proofs-added', proofs: [{}] } };
+      await service.processAnchorProofsAdded(body as any);
+      expect(ledgerService.getAnchor).not.toHaveBeenCalled();
+    });
+
+    it('skips when proofs is empty or not an array', async () => {
+      await service.processAnchorProofsAdded({
+        data: { signal: 'anchor-proofs-added', anchor: 'a1', proofs: [] },
+      } as any);
+      expect(ledgerService.getAnchor).not.toHaveBeenCalled();
+
+      await service.processAnchorProofsAdded({
+        data: { signal: 'anchor-proofs-added', anchor: 'a1' },
+      } as any);
+      expect(ledgerService.getAnchor).not.toHaveBeenCalled();
+    });
+
+    it('skips when anchor not found on ledger', async () => {
+      const body = { ...validBody, data: { ...validBody.data, handle: 'evt_notfound' } };
+      (ledgerService.getAnchor as jest.Mock).mockResolvedValue(null);
+      await service.processAnchorProofsAdded(body as any);
+      expect(ledgerService.getAnchor).toHaveBeenCalledWith('my-anchor');
+      expect(ledgerService.addProofToAnchorWithCustom).not.toHaveBeenCalled();
+    });
+
+    it('skips proof when anchor already has same status', async () => {
+      const body = { ...validBody, data: { ...validBody.data, handle: 'evt_samestatus' } };
+      (ledgerService.getAnchor as jest.Mock).mockResolvedValue({
+        data: { handle: 'my-anchor' },
+      });
+      (ledgerService.getAnchorStatus as jest.Mock).mockResolvedValue('COMPLETED');
+      await service.processAnchorProofsAdded(body as any);
+      expect(ledgerService.getAnchorStatus).toHaveBeenCalledWith('my-anchor');
+      expect(ledgerService.addProofToAnchorWithCustom).not.toHaveBeenCalled();
+    });
+
+    it('skips proof when anchor already has a proof with that status (loop guard)', async () => {
+      const body = { ...validBody, data: { ...validBody.data, handle: 'evt_loopguard' } };
+      (ledgerService.getAnchor as jest.Mock).mockResolvedValue({
+        data: { handle: 'my-anchor' },
+      });
+      (ledgerService.getAnchorStatus as jest.Mock).mockResolvedValue('PENDING');
+      (ledgerService.anchorHasProofWithStatus as jest.Mock).mockResolvedValue(true);
+      await service.processAnchorProofsAdded(body as any);
+      expect(ledgerService.anchorHasProofWithStatus).toHaveBeenCalledWith(
+        'my-anchor',
+        'COMPLETED',
+      );
+      expect(ledgerService.addProofToAnchorWithCustom).not.toHaveBeenCalled();
+    });
+
+    it('adds proof when status differs and anchor does not have that status', async () => {
+      const body = { ...validBody, data: { ...validBody.data, handle: 'evt_addproof' } };
+      (ledgerService.getAnchor as jest.Mock).mockResolvedValue({
+        data: { handle: 'my-anchor' },
+      });
+      (ledgerService.getAnchorStatus as jest.Mock)
+        .mockResolvedValueOnce('PENDING')
+        .mockResolvedValueOnce('COMPLETED');
+      (ledgerService.anchorHasProofWithStatus as jest.Mock).mockResolvedValue(false);
+      (ledgerService.addProofToAnchorWithCustom as jest.Mock).mockResolvedValue({});
+
+      await service.processAnchorProofsAdded(body as any);
+
+      expect(ledgerService.addProofToAnchorWithCustom).toHaveBeenCalledTimes(1);
+      expect(ledgerService.addProofToAnchorWithCustom).toHaveBeenCalledWith(
+        'my-anchor',
+        { status: 'COMPLETED', reason: 'paid' },
+      );
+    });
+
+    it('skips proofs without custom or custom.status', async () => {
+      const body = {
+        data: {
+          handle: 'evt_nocustom',
+          signal: 'anchor-proofs-added',
+          anchor: 'my-anchor',
+          proofs: [
+            {},
+            { custom: {} },
+            { custom: { other: 'x' } },
+          ],
+        },
+      };
+      (ledgerService.getAnchor as jest.Mock).mockResolvedValue({
+        data: { handle: 'my-anchor' },
+      });
+      (ledgerService.getAnchorStatus as jest.Mock).mockResolvedValue('PENDING');
+      (ledgerService.anchorHasProofWithStatus as jest.Mock).mockResolvedValue(false);
+
+      await service.processAnchorProofsAdded(body as any);
+
+      expect(ledgerService.addProofToAnchorWithCustom).not.toHaveBeenCalled();
+    });
+
+    it('does not process same event twice (idempotency / loop guard)', async () => {
+      const body = { ...validBody, data: { ...validBody.data, handle: 'evt_idem' } };
+      (ledgerService.getAnchor as jest.Mock).mockResolvedValue({
+        data: { handle: 'my-anchor' },
+      });
+      (ledgerService.getAnchorStatus as jest.Mock).mockResolvedValue('PENDING');
+      (ledgerService.anchorHasProofWithStatus as jest.Mock).mockResolvedValue(false);
+      (ledgerService.addProofToAnchorWithCustom as jest.Mock).mockResolvedValue({});
+
+      await service.processAnchorProofsAdded(body as any);
+      await service.processAnchorProofsAdded(body as any);
+
+      expect(ledgerService.getAnchor).toHaveBeenCalledTimes(1);
+      expect(ledgerService.addProofToAnchorWithCustom).toHaveBeenCalledTimes(1);
     });
   });
 });
