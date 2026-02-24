@@ -21,6 +21,7 @@ import {
 import { Request } from 'express';
 import { CollectionsService } from './services/collections.service';
 import { AnchorCreatedEventDto } from './dto/anchor-created-event.dto';
+import { AnchorProofsAddedEventDto } from './dto/anchor-proofs-added-event.dto';
 import { IntentUpdatedEventDto } from './dto/intent-updated-event.dto';
 import { CollectionResponseDto } from './dto/collection-response.dto';
 
@@ -115,6 +116,35 @@ export class CollectionsController {
         );
     });
 
+    return { success: true };
+  }
+
+  @Post('webhooks/anchor-proofs-added')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Receive anchor-proofs-added webhook',
+    description:
+      'Accepts Ledger anchor-proofs-added events. Looks up the anchor on the ledger; if its status differs from the received proof status, forwards the proof to the anchor (including full custom). Returns 200 immediately; processing runs asynchronously.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Event accepted (processing is async)',
+  })
+  async handleAnchorProofsAdded(
+    @Body() event: AnchorProofsAddedEventDto,
+    @Req() request: Request,
+  ): Promise<{ success: boolean }> {
+    const body = request.body;
+    setImmediate(() => {
+      this.collectionsService
+        .processAnchorProofsAdded(body)
+        .catch((err) =>
+          this.logger.error(
+            `anchor-proofs-added webhook async processing error: ${err?.message}`,
+            err?.stack,
+          ),
+        );
+    });
     return { success: true };
   }
 

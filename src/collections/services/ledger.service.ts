@@ -568,6 +568,97 @@ export class LedgerService {
   }
 
   /**
+   * Read the anchor from the ledger and return its current status (from data.custom.status
+   * or from the latest proof's custom.status). No fixed set of statuses; returns whatever
+   * the anchor has so the bridge can compare it to incoming proofs without rigid validation.
+   */
+  async getAnchorStatus(anchorHandle: string): Promise<string | null> {
+    try {
+      const record = await this.getAnchor(anchorHandle);
+      const data = record?.data ?? record;
+      const meta = record?.meta ?? {};
+
+      const fromData = data?.custom?.status;
+      if (fromData != null && fromData !== '') {
+        return String(fromData);
+      }
+
+      const proofs = Array.isArray(meta.proofs) ? meta.proofs : [];
+      const last = proofs[proofs.length - 1];
+      const fromProof = last?.custom?.status;
+      if (fromProof != null && fromProof !== '') {
+        return String(fromProof);
+      }
+
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Returns true if the anchor already has any proof (from any signer) with the given status.
+   * Used to avoid adding duplicate proofs and prevent loops when re-processing events.
+   */
+  async anchorHasProofWithStatus(
+    anchorHandle: string,
+    status: string,
+  ): Promise<boolean> {
+    try {
+      const record = await this.getAnchor(anchorHandle);
+      const proofs = Array.isArray(record?.meta?.proofs) ? record.meta.proofs : [];
+      return proofs.some(
+        (p: any) => p?.custom?.status != null && String(p.custom.status) === status,
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Add a proof to an anchor with arbitrary custom payload (e.g. from anchor-proofs-added event).
+   * Use this to forward proofs including full custom from external events.
+   */
+  async addProofToAnchorWithCustom(
+    anchorHandle: string,
+    custom: Record<string, unknown>,
+  ): Promise<any> {
+    try {
+      const config = this.configService.get('minka');
+      const record = await this.getAnchor(anchorHandle);
+      if (!record?.data?.handle) {
+        throw new Error(`Anchor record missing data.handle for ${anchorHandle}`);
+      }
+
+      const { response } = await this.sdk.anchor
+        .from(record)
+        .hash()
+        .sign([
+          {
+            keyPair: {
+              format: config.signer.format,
+              public: config.signer.public,
+              secret: config.signer.secret,
+            },
+            custom,
+          },
+        ])
+        .send();
+
+      this.logger.log(
+        `Proof with custom added to anchor ${anchorHandle}: ${JSON.stringify(custom)}`,
+      );
+      return response;
+    } catch (error) {
+      this.logger.error(
+        `Error adding proof to anchor ${anchorHandle}:`,
+        error,
+      );
+      throw error;
+    }
+  }
+
+  /**
    * Add a proof to an anchor (e.g. COMPLETED or CANCELLED). Uses SDK anchor.from(record).hash().sign().send().
    */
   async addProofToAnchor(

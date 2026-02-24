@@ -12,6 +12,18 @@ import { IntentUpdatedEventDto } from '../dto/intent-updated-event.dto';
 /** Per-intent-handle lock to serialize anchor proof updates and avoid duplicate proofs when webhook is called in parallel. */
 const anchorUpdateLockByIntent = new Map<string, Promise<void>>();
 
+/** Processed anchor-proofs-added event ids (eventId -> timestamp) to avoid processing the same event twice and prevent loops. TTL 15 min. */
+const PROCESSED_ANCHOR_PROOFS_ADDED_TTL_MS = 15 * 60 * 1000;
+const processedAnchorProofsAddedEvents = new Map<string, number>();
+
+function cleanupProcessedAnchorProofsAdded(now: number) {
+  const toDelete: string[] = [];
+  for (const [id, ts] of processedAnchorProofsAddedEvents.entries()) {
+    if (now - ts > PROCESSED_ANCHOR_PROOFS_ADDED_TTL_MS) toDelete.push(id);
+  }
+  toDelete.forEach((id) => processedAnchorProofsAddedEvents.delete(id));
+}
+
 @Injectable()
 export class CollectionsService {
   private readonly logger = new Logger(CollectionsService.name);
@@ -485,6 +497,120 @@ export class CollectionsService {
       this.logger.error(
         `Error processing RTP intent-updated event: ${error?.message}`,
         error?.stack,
+      );
+      // Don't throw - errors are logged but don't fail the webhook response
+    }
+  }
+
+  /**
+   * Process anchor-proofs-added event: if the anchor on the ledger has a different status
+   * than the proof received, send that proof to the anchor (including full custom).
+   */
+  async processAnchorProofsAdded(
+    body: {
+      hash?: string;
+      data?: {
+        handle?: string;
+        signal?: string;
+        anchor?: string;
+        proofs?: Array<{ custom?: Record<string, unknown>; [key: string]: unknown }>;
+      };
+      meta?: Record<string, unknown>;
+    },
+  ): Promise<void> {
+    const signal = body?.data?.signal;
+    const anchorHandle = body?.data?.anchor;
+    const proofs = body?.data?.proofs;
+
+    if (signal !== 'anchor-proofs-added') {
+      this.logger.warn(
+        `anchor-proofs-added webhook ignored: signal is "${signal}", expected "anchor-proofs-added"`,
+      );
+      return;
+    }
+    if (!anchorHandle) {
+      this.logger.warn(
+        'anchor-proofs-added webhook ignored: missing data.anchor',
+      );
+      return;
+    }
+    if (!Array.isArray(proofs) || proofs.length === 0) {
+      this.logger.log(
+        `anchor-proofs-added webhook: no proofs in payload for anchor ${anchorHandle}, skipping`,
+      );
+      return;
+    }
+
+    const eventId = body?.data?.handle ?? body?.hash ?? null;
+    if (eventId) {
+      const now = Date.now();
+      cleanupProcessedAnchorProofsAdded(now);
+      if (processedAnchorProofsAddedEvents.has(eventId)) {
+        this.logger.log(
+          `anchor-proofs-added webhook: event already processed (id=${eventId}), skipping to avoid loop`,
+        );
+        return;
+      }
+      processedAnchorProofsAddedEvents.set(eventId, now);
+    }
+
+    try {
+      const anchor = await this.ledgerService.getAnchor(anchorHandle);
+      if (!anchor?.data?.handle) {
+        this.logger.warn(
+          `anchor-proofs-added: anchor not found on ledger: ${anchorHandle}`,
+        );
+        return;
+      }
+
+      let currentStatus = await this.ledgerService.getAnchorStatus(
+        anchorHandle,
+      );
+      this.logger.log(
+        `anchor-proofs-added: anchor ${anchorHandle} current status=${currentStatus ?? '(none)'}`,
+      );
+
+      for (const proof of proofs) {
+        const custom = proof?.custom;
+        if (!custom || typeof custom !== 'object') continue;
+
+        const proofStatus =
+          custom.status != null ? String(custom.status) : null;
+        if (proofStatus == null || proofStatus === '') continue;
+
+        if (currentStatus !== null && currentStatus === proofStatus) {
+          this.logger.log(
+            `anchor-proofs-added: anchor ${anchorHandle} already has status ${proofStatus}, skipping proof`,
+          );
+          continue;
+        }
+
+        const alreadyHasThisStatus =
+          await this.ledgerService.anchorHasProofWithStatus(
+            anchorHandle,
+            proofStatus,
+          );
+        if (alreadyHasThisStatus) {
+          this.logger.log(
+            `anchor-proofs-added: anchor ${anchorHandle} already has a proof with status ${proofStatus}, skipping to avoid duplicate/loop`,
+          );
+          currentStatus = proofStatus;
+          continue;
+        }
+
+        this.logger.log(
+          `anchor-proofs-added: adding proof to anchor ${anchorHandle} with custom (status=${proofStatus})`,
+        );
+        await this.ledgerService.addProofToAnchorWithCustom(
+          anchorHandle,
+          { ...custom },
+        );
+        currentStatus = await this.ledgerService.getAnchorStatus(anchorHandle);
+      }
+    } catch (error) {
+      this.logger.error(
+        `Error processing anchor-proofs-added: ${(error as Error)?.message}`,
+        (error as Error)?.stack,
       );
       // Don't throw - errors are logged but don't fail the webhook response
     }
